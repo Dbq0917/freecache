@@ -99,7 +99,25 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	}
 	now := seg.timer.Now()
 	expireAt := expireAtFrom(now, expireSeconds)
+	return seg.write(key, value, hashVal, expireAt, now)
+}
 
+// setWithExpireAt writes an entry using an absolute expiration timestamp. It
+// is used during segment migration so entries keep their original expiration
+// instead of gaining a fresh relative TTL. expireAt == 0 means no expiration.
+func (seg *segment) setWithExpireAt(key, value []byte, hashVal uint64, expireAt uint32) (err error) {
+	if len(key) > 65535 {
+		return ErrLargeKey
+	}
+	maxKeyValLen := len(seg.rb.data)/4 - ENTRY_HDR_SIZE
+	if len(key)+len(value) > maxKeyValLen {
+		return ErrLargeEntry
+	}
+	return seg.write(key, value, hashVal, expireAt, seg.timer.Now())
+}
+
+func (seg *segment) write(key, value []byte, hashVal uint64, expireAt, now uint32) (err error) {
+	maxKeyValLen := len(seg.rb.data)/4 - ENTRY_HDR_SIZE
 	slotId := uint8(hashVal >> 8)
 	hash16 := uint16(hashVal >> 16)
 	slot := seg.getSlot(slotId)

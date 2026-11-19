@@ -18,6 +18,7 @@ without increased latency and degraded throughput.
 * Strictly limited memory usage
 * Come with a toy server that supports a few basic Redis commands with pipeline
 * Iterator support
+* Online resize: grow or shrink the cache at runtime without stopping reads or writes
 
 ## Performance
 
@@ -74,7 +75,20 @@ Each segment has its own lock, so it supports high concurrent access.
 ## TODO
 
 * Support dump to file and load from file.
-* Support resize cache size at runtime.
+
+## Online Resize
+
+`Resize(newSize int)` changes the total cache capacity while the cache keeps serving
+traffic. Segments are migrated one at a time, so only the segment currently being
+copied takes a brief lock; every other segment stays fully available.
+
+* **Writes never stop.** A segment accepts writes right up until its copy starts and
+  again immediately after the copy finishes.
+* **Reads always see the newest value.** While a segment is migrating it has two
+  generations: reads consult the active new generation first and only fall back to the
+  frozen old one. Once the copy completes, the old segment is released, so there is no
+  permanently half-migrated shard whose stale copy can diverge from the new one.
+* **Shrinking** evicts the entries that no longer fit using the cache's normal policy.
 
 ## License
 

@@ -38,7 +38,7 @@ func (it *Iterator) Next() *Entry {
 func (it *Iterator) nextForSegment(segIdx int) *Entry {
 	it.cache.locks[segIdx].Lock()
 	defer it.cache.locks[segIdx].Unlock()
-	seg := &it.cache.segments[segIdx]
+	seg := it.cache.activeSeg(segIdx)
 	for it.slotIdx < 256 {
 		entry := it.nextForSlot(seg, it.slotIdx)
 		if entry != nil {
