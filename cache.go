@@ -54,8 +54,8 @@ func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
 
 // Set sets a key, value and expiration for a cache entry and stores it in the cache.
 // If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
-// the entry will not be written to the cache. expireSeconds <= 0 means no expire,
-// but it can be evicted when cache is full.
+// the entry will not be written to the cache. expireSeconds == 0 means no expire, but it can be
+// evicted when cache is full. A negative expireSeconds is treated as already expired.
 func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
@@ -65,8 +65,8 @@ func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
 	return
 }
 
-// Touch updates the expiration time of an existing key. expireSeconds <= 0 means no expire,
-// but it can be evicted when cache is full.
+// Touch updates the expiration time of an existing key. expireSeconds == 0 means no expire, but it can be
+// evicted when cache is full. A negative expireSeconds is treated as already expired.
 func (cache *Cache) Touch(key []byte, expireSeconds int) (err error) {
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
@@ -162,8 +162,8 @@ func (cache *Cache) GetOrSet(key, value []byte, expireSeconds int) (retValue []b
 
 // SetAndGet sets a key, value and expiration for a cache entry and stores it in the cache.
 // If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
-// the entry will not be written to the cache. expireSeconds <= 0 means no expire,
-// but it can be evicted when cache is full.  Returns existing value if record exists
+// the entry will not be written to the cache. expireSeconds == 0 means no expire, but it can be
+// evicted when cache is full. A negative expireSeconds is treated as already expired.  Returns existing value if record exists
 // with a bool value to indicate whether an existing record was found
 func (cache *Cache) SetAndGet(key, value []byte, expireSeconds int) (retValue []byte, found bool, err error) {
 	hashVal := hashFunc(key)
@@ -182,8 +182,8 @@ func (cache *Cache) SetAndGet(key, value []byte, expireSeconds int) (retValue []
 // Update gets value for a key, passes it to updater function that decides if set should be called as well
 // This allows for an atomic Get plus Set call using the existing value to decide on whether to call Set.
 // If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
-// the entry will not be written to the cache. expireSeconds <= 0 means no expire,
-// but it can be evicted when cache is full. Returns bool value to indicate if existing record was found along with bool
+// the entry will not be written to the cache. expireSeconds == 0 means no expire, but it can be
+// evicted when cache is full. A negative expireSeconds is treated as already expired. Returns bool value to indicate if existing record was found along with bool
 // value indicating the value was replaced and error if any
 func (cache *Cache) Update(key []byte, updater Updater) (found bool, replaced bool, err error) {
 	hashVal := hashFunc(key)

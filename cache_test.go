@@ -1508,3 +1508,131 @@ func TestExpireSecondsOverflowDoesNotWrap(t *testing.T) {
 		t.Fatalf("Touch(..., expireSeconds=%d) stored expireAt=0 (never expires)", wrapToZero)
 	}
 }
+
+func TestNegativeExpireSecondsTreatedAsExpired(t *testing.T) {
+	timer := new(mockTimer)
+	var now uint32 = 1000
+	timer.SetNowCallback(func() uint32 { return now })
+	cache := NewCacheCustomTimer(minBufSize, timer)
+
+	// A negative TTL comes from a signed remaining-time computation
+	// (expireAt-now) that went below zero. It must not become never-expire.
+	if err := cache.Set([]byte("set-neg"), []byte("v"), -1); err != nil {
+		t.Fatal(err)
+	}
+	_, expireAt, err := cache.PeekWithExpiration([]byte("set-neg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expireAt == 0 {
+		t.Fatal("Set with negative expireSeconds stored expireAt=0 (never expires)")
+	}
+	if expireAt > now {
+		t.Fatalf("expireAt=%d should not be after now=%d", expireAt, now)
+	}
+	if _, err := cache.Get([]byte("set-neg")); err != ErrNotFound {
+		t.Fatalf("Get(negative TTL): got %v, want ErrNotFound", err)
+	}
+
+	// Touch shares the boundary.
+	if err := cache.Set([]byte("touch-neg"), []byte("v"), 60); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Touch([]byte("touch-neg"), -30); err != nil {
+		t.Fatal(err)
+	}
+	_, expireAt, err = cache.PeekWithExpiration([]byte("touch-neg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expireAt == 0 {
+		t.Fatal("Touch with negative expireSeconds stored expireAt=0 (never expires)")
+	}
+	if _, err := cache.Get([]byte("touch-neg")); err != ErrNotFound {
+		t.Fatalf("Get after negative Touch: got %v, want ErrNotFound", err)
+	}
+
+	// GetOrSet with a negative TTL must not leave a permanent key either.
+	if _, err := cache.GetOrSet([]byte("gos-neg"), []byte("v"), -7); err != nil {
+		t.Fatal(err)
+	}
+	_, expireAt, err = cache.PeekWithExpiration([]byte("gos-neg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expireAt == 0 {
+		t.Fatal("GetOrSet with negative expireSeconds stored expireAt=0 (never expires)")
+	}
+
+	// expireSeconds == 0 still means no expiry.
+	if err := cache.Set([]byte("no-expire"), []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	_, expireAt, err = cache.PeekWithExpiration([]byte("no-expire"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expireAt != 0 {
+		t.Fatalf("expireSeconds=0: expireAt=%d, want 0 (no expiry)", expireAt)
+	}
+
+	// Far in the future, only the no-expiry key remains.
+	now = 1_800_000_000
+	if _, err := cache.Get([]byte("gos-neg")); err != ErrNotFound {
+		t.Fatalf("Get(gos-neg) long after: got %v, want ErrNotFound", err)
+	}
+	if got := cache.EntryCount(); got != 1 {
+		t.Fatalf("EntryCount=%d, want 1 (only the no-expiry key)", got)
+	}
+	if _, err := cache.Get([]byte("no-expire")); err != nil {
+		t.Fatalf("no-expiry key should survive: %v", err)
+	}
+}
+
+func TestClockRollbackLeavesNoPermanentKeys(t *testing.T) {
+	timer := new(mockTimer)
+	var now uint32 = 1_700_000_000
+	timer.SetNowCallback(func() uint32 { return now })
+	cache := NewCacheCustomTimer(minBufSize, timer)
+
+	// First batch with normal TTLs.
+	const batch = 100
+	for i := 0; i < batch; i++ {
+		key := []byte(strconv.Itoa(i))
+		if err := cache.Set(key, []byte("v"), 60); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Roll the clock back, then write a second batch whose TTLs are
+	// remaining-time values (expireAt-now) computed by a cleanup pass.
+	// For keys near expiry the signed remaining time is negative.
+	now -= 30
+	for i := 0; i < batch; i++ {
+		key := []byte(strconv.Itoa(i))
+		remaining := 91 - 2*i // odd values: some positive, some negative, never 0
+		if err := cache.Set(key, []byte("v2"), remaining); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// No key may be stored as never-expire.
+	it := cache.NewIterator()
+	for entry := it.Next(); entry != nil; entry = it.Next() {
+		if entry.ExpireAt == 0 {
+			t.Fatalf("key %q became permanent after clock rollback", entry.Key)
+		}
+	}
+
+	// After the clock passes every expiry, the cache must drain completely.
+	now = 1_700_000_200
+	for i := 0; i < batch; i++ {
+		key := []byte(strconv.Itoa(i))
+		if _, err := cache.Get(key); err != ErrNotFound {
+			t.Fatalf("Get(%q) long after expiry: got %v, want ErrNotFound", key, err)
+		}
+	}
+	if got := cache.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount=%d, want 0: permanent keys leaked after clock rollback", got)
+	}
+}
