@@ -312,8 +312,9 @@ func TestPeekWithExpiration(t *testing.T) {
 		if !bytes.Equal(val, res) {
 			t.Fatalf("value got %q, want %q", res, val)
 		}
-		if want := now + uint32(expireSeconds); expiry != want {
-			t.Errorf("expiry got %d, want %d", expiry, want)
+		// Expiration jitter spreads the expiry over [now+ttl, now+ttl+ttl/8].
+		if min, max := now+uint32(expireSeconds), now+uint32(expireSeconds)+uint32(expireSeconds>>expireJitterShift); expiry < min || expiry > max {
+			t.Errorf("expiry got %d, want within [%d, %d]", expiry, min, max)
 		}
 	})
 
@@ -519,8 +520,9 @@ func testTTLWithNotYetExpiredKey(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected nil, but got %v", err)
 	}
-	if ttl != uint32(expireSeconds) {
-		t.Errorf("expected %d, but got %d ", expireSeconds, ttl)
+	// Expiration jitter may add up to ttl/8 extra seconds.
+	if min, max := uint32(expireSeconds), uint32(expireSeconds)+uint32(expireSeconds>>expireJitterShift); ttl < min || ttl > max {
+		t.Errorf("expected ttl within [%d, %d], but got %d ", min, max, ttl)
 	}
 	if timer.NowCallsCount() != 2 { // one call from set, one from ttl
 		t.Errorf("expected %d, but got %d ", 2, timer.NowCallsCount())
@@ -539,7 +541,9 @@ func testTTLWithExpiredKey(t *testing.T) {
 		case 1:
 			return now
 		case 2:
-			return now + uint32(expireSeconds)
+			// Beyond the maximum expiration jitter, so the key has
+			// definitely expired.
+			return now + uint32(expireSeconds) + maxExpireJitterSecs + 1
 		}
 
 		return now
@@ -729,8 +733,9 @@ func TestAverageAccessTimeWithClockRollback(t *testing.T) {
 					t.Fatalf("AverageAccessTime = %d, want %d", got, now)
 				}
 				ttl, err := cache.TTL(key)
-				if err != nil || ttl != 160-now {
-					t.Fatalf("TTL at %d: ttl = %d, err = %v, want %d", now, ttl, err, 160-now)
+				// Expiration jitter may add up to 60/8 extra seconds.
+				if err != nil || ttl < 160-now || ttl > 160+7-now {
+					t.Fatalf("TTL at %d: ttl = %d, err = %v, want within [%d, %d]", now, ttl, err, 160-now, 160+7-now)
 				}
 			}
 		})
@@ -1489,8 +1494,9 @@ func TestExpireSecondsOverflowDoesNotWrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if expireAt != now+60 {
-		t.Fatalf("truncated large expireSeconds: expireAt=%d, want %d", expireAt, now+60)
+	// Expiration jitter spreads the expiry over [now+60, now+60+60/8].
+	if expireAt < now+60 || expireAt > now+60+7 {
+		t.Fatalf("truncated large expireSeconds: expireAt=%d, want within [%d, %d]", expireAt, now+60, now+60+7)
 	}
 
 	// Touch shares the wrap path.
@@ -1506,5 +1512,83 @@ func TestExpireSecondsOverflowDoesNotWrap(t *testing.T) {
 	}
 	if expireAt == 0 {
 		t.Fatalf("Touch(..., expireSeconds=%d) stored expireAt=0 (never expires)", wrapToZero)
+	}
+}
+
+func TestExpireJitterSpreadsExpiration(t *testing.T) {
+	const now uint32 = 1_700_000_000
+	timer := new(mockTimer)
+	timer.SetNowCallback(func() uint32 { return now })
+	cache := NewCacheCustomTimer(1024*1024, timer)
+
+	// A batch of keys written in the same second with the same TTL must not
+	// all expire in the same second. TTL 3600 gives a raw window of 450s,
+	// capped at maxExpireJitterSecs.
+	const expireSeconds = 3600
+	const n = 2000
+	expireAts := make(map[uint32]int)
+	for i := 0; i < n; i++ {
+		key := []byte("jitter-key-" + strconv.Itoa(i))
+		if err := cache.Set(key, []byte("v"), expireSeconds); err != nil {
+			t.Fatal(err)
+		}
+		_, expireAt, err := cache.PeekWithExpiration(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if min, max := uint32(now+expireSeconds), uint32(now+expireSeconds+maxExpireJitterSecs); expireAt < min || expireAt > max {
+			t.Fatalf("expireAt=%d outside [%d, %d]", expireAt, min, max)
+		}
+		expireAts[expireAt]++
+	}
+	if len(expireAts) < maxExpireJitterSecs/2 {
+		t.Fatalf("expirations clustered into %d distinct seconds, want a spread over most of the %ds window", len(expireAts), maxExpireJitterSecs)
+	}
+	for at, count := range expireAts {
+		if count > n/20 {
+			t.Fatalf("%d/%d keys expire in the same second %d", count, n, at)
+		}
+	}
+
+	// The jitter is deterministic per key: re-setting or touching a key with
+	// the same TTL lands on the same expiration second.
+	key := []byte("jitter-key-0")
+	_, want, err := cache.PeekWithExpiration(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Set(key, []byte("v2"), expireSeconds); err != nil {
+		t.Fatal(err)
+	}
+	if _, got, err := cache.PeekWithExpiration(key); err != nil || got != want {
+		t.Fatalf("re-Set: expireAt=%d, want %d (err=%v)", got, want, err)
+	}
+	if err := cache.Touch(key, expireSeconds); err != nil {
+		t.Fatal(err)
+	}
+	if _, got, err := cache.PeekWithExpiration(key); err != nil || got != want {
+		t.Fatalf("Touch: expireAt=%d, want %d (err=%v)", got, want, err)
+	}
+}
+
+func TestExpireJitterDisabledForShortTTL(t *testing.T) {
+	const now uint32 = 1_700_000_000
+	timer := new(mockTimer)
+	timer.SetNowCallback(func() uint32 { return now })
+	cache := NewCacheCustomTimer(1024*1024, timer)
+
+	// TTLs below 8 seconds have a zero jitter window and keep exact expiry.
+	for ttl := 1; ttl < 8; ttl++ {
+		key := []byte("short-ttl-" + strconv.Itoa(ttl))
+		if err := cache.Set(key, []byte("v"), ttl); err != nil {
+			t.Fatal(err)
+		}
+		_, expireAt, err := cache.PeekWithExpiration(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := now + uint32(ttl); expireAt != want {
+			t.Fatalf("ttl=%d: expireAt=%d, want exactly %d (no jitter for short TTL)", ttl, expireAt, want)
+		}
 	}
 }

@@ -57,10 +57,16 @@ fmt.Println("entry count ", cache.EntryCount())
 * If you allocate large amount of memory, you may need to set `debug.SetGCPercent()`
 to a much lower percentage to get a normal GC frequency.
 * If you set a key to be expired in X seconds, e.g. using `cache.Set(key, val, X)`, 
-the effective cache duration will be within this range: `(X-1, X] seconds`.
+the effective cache duration will be within this range: `(X-1, X + J] seconds`,
+where `J` is a deterministic per-key jitter of at most `min(X/8, 300)` seconds
+(zero for `X < 8`).
 This is because that sub-second time at the moment will be ignored when calculating the
 the expiration: for example, if the current time is 8:15::01.800 (800 milliseconds passed
 since 8:15::01), the actual duration will be `X-800ms`.
+The jitter is derived from the key hash and added to the expiration time, so a
+batch of keys written in the same second with the same TTL spreads its
+expiration over the jitter window instead of expiring all at once. This avoids
+latency spikes when a large batch of entries expires simultaneously.
 
 ## How it is done
 

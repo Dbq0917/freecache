@@ -67,25 +67,57 @@ func newSegment(bufSize int, segId int, timer Timer) (seg segment) {
 	return
 }
 
+const (
+	// expireJitterShift spreads expiration times over a window of 1/8 of the
+	// TTL (ttl >> 3), so keys written together in the same second with the
+	// same TTL do not all expire in the same second.
+	expireJitterShift = 3
+	// maxExpireJitterSecs caps the jitter window so very long TTLs do not
+	// accumulate an unbounded amount of extra lifetime.
+	maxExpireJitterSecs = 300
+)
+
+// expireJitter returns a deterministic per-key offset in [0, window], where
+// window is 1/8 of the TTL capped at maxExpireJitterSecs. It is derived from
+// the key hash, so it costs no RNG and no locking on the write path, and the
+// same key always lands on the same offset. TTLs below 8 seconds get no
+// jitter, preserving sub-window expiration semantics for short-lived keys.
+func expireJitter(hashVal uint64, ttl uint32) uint32 {
+	window := ttl >> expireJitterShift
+	if window > maxExpireJitterSecs {
+		window = maxExpireJitterSecs
+	}
+	if window == 0 {
+		return 0
+	}
+	return uint32(hashVal>>32) % (window + 1)
+}
+
 // expireAtFrom converts a relative TTL in seconds into an absolute unix
 // timestamp. expireSeconds <= 0 means no expiry (0).
 //
+// A deterministic per-key jitter (see expireJitter) is added on top of the
+// TTL so that a batch of keys written in the same second with the same TTL
+// spreads its expiration over the jitter window instead of expiring all at
+// once. The effective lifetime of an entry is therefore
+// (ttl-1, ttl+jitter] seconds.
+//
 // The relative TTL is taken as uint32(expireSeconds), matching the historical
-// cast before addition. If now+ttl wraps in uint32, the old code could store 0
-// (treated as never-expire) or a time in the past (immediate miss). Clamp to
-// math.MaxUint32 so the entry still expires at the far end of the representable
-// range instead of wrapping.
-func expireAtFrom(now uint32, expireSeconds int) uint32 {
+// cast before addition. If now+ttl+jitter exceeds the uint32 range, the old
+// code could store 0 (treated as never-expire) or a time in the past
+// (immediate miss). Clamp to math.MaxUint32 so the entry still expires at the
+// far end of the representable range instead of wrapping.
+func expireAtFrom(now uint32, expireSeconds int, hashVal uint64) uint32 {
 	if expireSeconds <= 0 {
 		return 0
 	}
 	ttl := uint32(expireSeconds)
-	expireAt := now + ttl
-	if expireAt < now {
+	expireAt := uint64(now) + uint64(ttl) + uint64(expireJitter(hashVal, ttl))
+	if expireAt > math.MaxUint32 {
 		// wrapped
 		return math.MaxUint32
 	}
-	return expireAt
+	return uint32(expireAt)
 }
 
 func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (err error) {
@@ -98,7 +130,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 		return ErrLargeEntry
 	}
 	now := seg.timer.Now()
-	expireAt := expireAtFrom(now, expireSeconds)
+	expireAt := expireAtFrom(now, expireSeconds, hashVal)
 
 	slotId := uint8(hashVal >> 8)
 	hash16 := uint16(hashVal >> 16)
@@ -197,7 +229,7 @@ func (seg *segment) touch(key []byte, hashVal uint64, expireSeconds int) (err er
 		return
 	}
 
-	expireAt := expireAtFrom(now, expireSeconds)
+	expireAt := expireAtFrom(now, expireSeconds, hashVal)
 
 	originAccessTime := hdr.accessTime
 	hdr.accessTime = now
