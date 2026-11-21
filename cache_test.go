@@ -237,7 +237,7 @@ func TestViewCallbackPanicReleasesLock(t *testing.T) {
 
 			// Check the lock before exercising the API so a regression fails
 			// immediately instead of hanging the test suite.
-			lock := &cache.locks[hashFunc(key)&segmentAndOpVal]
+			lock := &cache.locks[segmentID(hashFunc(key))]
 			if !lock.TryLock() {
 				t.Fatal("segment lock was not released after callback panic")
 			}
@@ -828,7 +828,9 @@ func TestInt64Key(t *testing.T) {
 }
 
 func TestIterator(t *testing.T) {
-	cache := NewCache(1024)
+	// Use a cache well above the minimum size so that no segment overflows
+	// and evicts entries regardless of how the keys spread across segments.
+	cache := NewCache(4 * 1024 * 1024)
 	count := 10000
 	for i := 0; i < count; i++ {
 		err := cache.Set([]byte(fmt.Sprintf("%d", i)), []byte(fmt.Sprintf("val%d", i)), 0)
