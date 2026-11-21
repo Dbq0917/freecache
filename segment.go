@@ -38,23 +38,24 @@ type entryHdr struct {
 // a segment contains 256 slots, a slot is an array of entry pointers ordered by hash16 value
 // the entry can be looked up by hash value of the key.
 type segment struct {
-	rb            RingBuf // ring buffer that stores data
-	segId         int
-	_             uint32
-	missCount     int64
-	hitCount      int64
-	entryCount    int64
-	totalCount    int64      // number of entries in ring buffer, including deleted entries.
-	totalTime     int64      // used to calculate least recent used entry.
-	timer         Timer      // Timer giving current time
-	totalEvacuate int64      // used for debug
-	totalExpired  int64      // used for debug
-	overwrites    int64      // used for debug
-	touched       int64      // used for debug
-	vacuumLen     int64      // up to vacuumLen, new data can be written without overwriting old data.
-	slotLens      [256]int32 // The actual length for every slot.
-	slotCap       int32      // max number of entry pointers a slot can hold.
-	slotsData     []entryPtr // shared by all 256 slots
+	rb               RingBuf // ring buffer that stores data
+	segId            int
+	_                uint32
+	missCount        int64
+	expiredMissCount int64
+	hitCount         int64
+	entryCount       int64
+	totalCount       int64      // number of entries in ring buffer, including deleted entries.
+	totalTime        int64      // used to calculate least recent used entry.
+	timer            Timer      // Timer giving current time
+	totalEvacuate    int64      // used for debug
+	totalExpired     int64      // expirations detected during evacuation
+	overwrites       int64      // used for debug
+	touched          int64      // used for debug
+	vacuumLen        int64      // up to vacuumLen, new data can be written without overwriting old data.
+	slotLens         [256]int32 // The actual length for every slot.
+	slotCap          int32      // max number of entry pointers a slot can hold.
+	slotsData        []entryPtr // shared by all 256 slots
 }
 
 func newSegment(bufSize int, segId int, timer Timer) (seg segment) {
@@ -191,9 +192,8 @@ func (seg *segment) touch(key []byte, hashVal uint64, expireSeconds int) (err er
 	now := seg.timer.Now()
 	if isExpired(hdr.expireAt, now) {
 		seg.delEntryPtr(slotId, slot, idx)
-		atomic.AddInt64(&seg.totalExpired, 1)
 		err = ErrNotFound
-		atomic.AddInt64(&seg.missCount, 1)
+		atomic.AddInt64(&seg.expiredMissCount, 1)
 		return
 	}
 
@@ -310,9 +310,8 @@ func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdrEntry entr
 		now := seg.timer.Now()
 		if isExpired(hdr.expireAt, now) {
 			seg.delEntryPtr(slotId, slot, idx)
-			atomic.AddInt64(&seg.totalExpired, 1)
 			err = ErrNotFound
-			atomic.AddInt64(&seg.missCount, 1)
+			atomic.AddInt64(&seg.expiredMissCount, 1)
 			return
 		}
 		atomic.AddInt64(&seg.totalTime, int64(now)-int64(hdr.accessTime))
@@ -468,6 +467,7 @@ func (seg *segment) resetStatistics() {
 	atomic.StoreInt64(&seg.overwrites, 0)
 	atomic.StoreInt64(&seg.hitCount, 0)
 	atomic.StoreInt64(&seg.missCount, 0)
+	atomic.StoreInt64(&seg.expiredMissCount, 0)
 }
 
 func (seg *segment) clear() {
@@ -482,6 +482,7 @@ func (seg *segment) clear() {
 
 	atomic.StoreInt64(&seg.hitCount, 0)
 	atomic.StoreInt64(&seg.missCount, 0)
+	atomic.StoreInt64(&seg.expiredMissCount, 0)
 	atomic.StoreInt64(&seg.entryCount, 0)
 	atomic.StoreInt64(&seg.totalCount, 0)
 	atomic.StoreInt64(&seg.totalTime, 0)

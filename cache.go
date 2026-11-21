@@ -337,10 +337,13 @@ func (cache *Cache) EvacuateCount() (count int64) {
 	return
 }
 
-// ExpiredCount is a metric indicating the number of times an expire occurred.
+// ExpiredCount is a metric indicating the number of times an expiration was
+// observed. It counts both entries found expired on access (see ExpiredMissCount)
+// and entries removed as expired during ring buffer evacuation.
 func (cache *Cache) ExpiredCount() (count int64) {
 	for i := range cache.segments {
 		count += atomic.LoadInt64(&cache.segments[i].totalExpired)
+		count += atomic.LoadInt64(&cache.segments[i].expiredMissCount)
 	}
 	return
 }
@@ -377,7 +380,9 @@ func (cache *Cache) HitCount() (count int64) {
 	return
 }
 
-// MissCount is a metric that returns the number of times a miss occurred in the cache.
+// MissCount is a metric that returns the number of lookups whose key does not
+// exist in the cache. Lookups whose key exists but has expired are reported
+// separately by ExpiredMissCount and are not counted here.
 func (cache *Cache) MissCount() (count int64) {
 	for i := range cache.segments {
 		count += atomic.LoadInt64(&cache.segments[i].missCount)
@@ -385,20 +390,54 @@ func (cache *Cache) MissCount() (count int64) {
 	return
 }
 
+// ExpiredMissCount is a metric that returns the number of lookups whose key was
+// present in the cache but had already expired. These are kept separate from
+// MissCount (key absent) so that TTL-driven misses do not pollute the miss
+// rate used for capacity planning.
+func (cache *Cache) ExpiredMissCount() (count int64) {
+	for i := range cache.segments {
+		count += atomic.LoadInt64(&cache.segments[i].expiredMissCount)
+	}
+	return
+}
+
 // LookupCount is a metric that returns the number of times a lookup for a given key occurred.
-func (cache *Cache) LookupCount() int64 {
-	return cache.HitCount() + cache.MissCount()
+// Every lookup ends in exactly one of three outcomes: a hit, a miss because the
+// key is absent, or a miss because the key has expired.
+func (cache *Cache) LookupCount() (count int64) {
+	return cache.HitCount() + cache.MissCount() + cache.ExpiredMissCount()
 }
 
 // HitRate is the ratio of hits over lookups.
 func (cache *Cache) HitRate() float64 {
-	hitCount, missCount := cache.HitCount(), cache.MissCount()
-	lookupCount := hitCount + missCount
+	lookupCount := cache.LookupCount()
 	if lookupCount == 0 {
 		return 0
-	} else {
-		return float64(hitCount) / float64(lookupCount)
 	}
+	return float64(cache.HitCount()) / float64(lookupCount)
+}
+
+// MissRate is the ratio of lookups whose key does not exist over all lookups.
+// It excludes expired entries and reflects genuine capacity pressure (cold
+// starts, evictions, scanning keys that were never cached), which is the signal
+// that should drive capacity planning.
+func (cache *Cache) MissRate() float64 {
+	lookupCount := cache.LookupCount()
+	if lookupCount == 0 {
+		return 0
+	}
+	return float64(cache.MissCount()) / float64(lookupCount)
+}
+
+// ExpiredRate is the ratio of lookups whose key had expired over all lookups.
+// It reflects TTL policy rather than cache capacity, so an expiration-driven
+// dip should not by itself trigger a capacity increase.
+func (cache *Cache) ExpiredRate() float64 {
+	lookupCount := cache.LookupCount()
+	if lookupCount == 0 {
+		return 0
+	}
+	return float64(cache.ExpiredMissCount()) / float64(lookupCount)
 }
 
 // OverwriteCount indicates the number of times entries have been overridden.

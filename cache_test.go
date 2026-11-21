@@ -458,6 +458,148 @@ func TestExpire(t *testing.T) {
 	}
 }
 
+func TestMissClassification(t *testing.T) {
+	const (
+		missingLookups = 40
+		expiredLookups = 10
+		healthyHits    = 50
+	)
+	var now uint32 = 1000
+	timer := new(mockTimer)
+	timer.SetNowCallback(func() uint32 { return now })
+	cache := NewCacheCustomTimer(1024, timer)
+
+	assertRates := func(wantHit, wantMiss, wantExpired float64) {
+		t.Helper()
+		if got := cache.HitRate(); got != wantHit {
+			t.Errorf("HitRate got %v, want %v", got, wantHit)
+		}
+		if got := cache.MissRate(); got != wantMiss {
+			t.Errorf("MissRate got %v, want %v", got, wantMiss)
+		}
+		if got := cache.ExpiredRate(); got != wantExpired {
+			t.Errorf("ExpiredRate got %v, want %v", got, wantExpired)
+		}
+		if sum := cache.HitRate() + cache.MissRate() + cache.ExpiredRate(); sum < 0.999999 || sum > 1.000001 {
+			t.Errorf("hit/miss/expired rates should reconcile to 1, got %v", sum)
+		}
+	}
+
+	// Phase 1: a batch scan over keys that were never cached (cold start).
+	for i := 0; i < missingLookups; i++ {
+		if _, err := cache.Get([]byte(fmt.Sprintf("missing-%d", i))); err != ErrNotFound {
+			t.Fatalf("Get missing-%d: got %v, want ErrNotFound", i, err)
+		}
+	}
+	if got := cache.MissCount(); got != missingLookups {
+		t.Errorf("MissCount got %d, want %d", got, missingLookups)
+	}
+	if got := cache.ExpiredMissCount(); got != 0 {
+		t.Errorf("ExpiredMissCount got %d, want 0", got)
+	}
+	if got := cache.LookupCount(); got != missingLookups {
+		t.Errorf("LookupCount got %d, want %d", got, missingLookups)
+	}
+	assertRates(0, 1.0, 0)
+
+	// Peek performs no expiry accounting and must not move lookup counters.
+	if _, err := cache.Peek([]byte("missing-0")); err != ErrNotFound {
+		t.Fatalf("Peek missing-0: got %v, want ErrNotFound", err)
+	}
+	if got := cache.LookupCount(); got != missingLookups {
+		t.Errorf("Peek changed LookupCount: got %d, want %d", got, missingLookups)
+	}
+
+	// Phase 2: keys present in the cache but expired before they are read.
+	for i := 0; i < expiredLookups; i++ {
+		if err := cache.Set([]byte(fmt.Sprintf("exp-%d", i)), []byte("v"), 10); err != nil {
+			t.Fatalf("Set exp-%d: %v", i, err)
+		}
+	}
+	now += 100
+	for i := 0; i < expiredLookups; i++ {
+		if _, err := cache.Get([]byte(fmt.Sprintf("exp-%d", i))); err != ErrNotFound {
+			t.Fatalf("Get exp-%d: got %v, want ErrNotFound", i, err)
+		}
+	}
+	if got := cache.MissCount(); got != missingLookups {
+		t.Errorf("expired lookups must stay out of not-found count: MissCount got %d, want %d", got, missingLookups)
+	}
+	if got := cache.ExpiredMissCount(); got != expiredLookups {
+		t.Errorf("ExpiredMissCount got %d, want %d", got, expiredLookups)
+	}
+	if got := cache.ExpiredCount(); got != expiredLookups {
+		t.Errorf("ExpiredCount got %d, want %d", got, expiredLookups)
+	}
+	mixedLookups := int64(missingLookups + expiredLookups)
+	if got := cache.LookupCount(); got != mixedLookups {
+		t.Errorf("LookupCount got %d, want %d", got, mixedLookups)
+	}
+	assertRates(
+		0,
+		float64(missingLookups)/float64(mixedLookups),
+		float64(expiredLookups)/float64(mixedLookups),
+	)
+
+	// The expired entry is deleted on access; a second lookup now reports absent.
+	if _, err := cache.Get([]byte("exp-0")); err != ErrNotFound {
+		t.Fatalf("second Get exp-0: got %v, want ErrNotFound", err)
+	}
+	if got := cache.MissCount(); got != missingLookups+1 {
+		t.Errorf("second lookup of removed key is absent: MissCount got %d, want %d", got, missingLookups+1)
+	}
+	if got := cache.ExpiredMissCount(); got != expiredLookups {
+		t.Errorf("ExpiredMissCount got %d, want %d", got, expiredLookups)
+	}
+
+	// Touching an expired key is also classified as an expired miss, not absent.
+	if err := cache.Set([]byte("touch-exp"), []byte("v"), 10); err != nil {
+		t.Fatalf("Set touch-exp: %v", err)
+	}
+	now += 100
+	if err := cache.Touch([]byte("touch-exp"), 20); err != ErrNotFound {
+		t.Fatalf("Touch expired key: got %v, want ErrNotFound", err)
+	}
+	if got := cache.ExpiredMissCount(); got != expiredLookups+1 {
+		t.Errorf("ExpiredMissCount after Touch got %d, want %d", got, expiredLookups+1)
+	}
+
+	// Phase 3: healthy traffic hits live keys and the hit rate recovers while
+	// the two miss components remain separately observable.
+	for i := 0; i < healthyHits; i++ {
+		key := []byte(fmt.Sprintf("live-%d", i))
+		if err := cache.Set(key, []byte("v"), 0); err != nil {
+			t.Fatalf("Set live-%d: %v", i, err)
+		}
+		if _, err := cache.Get(key); err != nil {
+			t.Fatalf("Get live-%d: %v", i, err)
+		}
+	}
+	wantTotal := int64(missingLookups + expiredLookups + 1 + 1 + healthyHits)
+	if got := cache.LookupCount(); got != wantTotal {
+		t.Fatalf("LookupCount got %d, want %d", got, wantTotal)
+	}
+	if got := cache.HitCount(); got != healthyHits {
+		t.Errorf("HitCount got %d, want %d", got, healthyHits)
+	}
+	assertRates(
+		float64(healthyHits)/float64(wantTotal),
+		float64(missingLookups+1)/float64(wantTotal),
+		float64(expiredLookups+1)/float64(wantTotal),
+	)
+
+	// ResetStatistics must clear the split counters and derived rates.
+	cache.ResetStatistics()
+	if cache.HitCount() != 0 || cache.MissCount() != 0 || cache.ExpiredMissCount() != 0 {
+		t.Errorf("ResetStatistics left counters behind: hit=%d miss=%d expired=%d",
+			cache.HitCount(), cache.MissCount(), cache.ExpiredMissCount())
+	}
+	if cache.HitRate() != 0 || cache.MissRate() != 0 || cache.ExpiredRate() != 0 {
+		t.Errorf("rates should be zero after reset: hit=%v miss=%v expired=%v",
+			cache.HitRate(), cache.MissRate(), cache.ExpiredRate())
+	}
+}
+
 func TestTTL(t *testing.T) {
 	t.Run("with no expire key", testTTLWithNoExpireKey)
 	t.Run("with expire key, not yet expired", testTTLWithNotYetExpiredKey)
@@ -974,6 +1116,9 @@ func TestRace(t *testing.T) {
 			_ = cache.HitCount()
 			_ = cache.LookupCount()
 			_ = cache.HitRate()
+			_ = cache.ExpiredMissCount()
+			_ = cache.MissRate()
+			_ = cache.ExpiredRate()
 			_ = cache.OverwriteCount()
 		}
 		wg.Done()

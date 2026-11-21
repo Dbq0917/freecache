@@ -62,6 +62,31 @@ This is because that sub-second time at the moment will be ignored when calculat
 the expiration: for example, if the current time is 8:15::01.800 (800 milliseconds passed
 since 8:15::01), the actual duration will be `X-800ms`.
 
+## Metrics
+
+Every lookup (`Get`, `GetOrSet`, `MultiGet`, `GetFn`, `Touch`, ...) is accounted
+exactly once and ends in one of three mutually exclusive outcomes:
+
+* **Hit** — key present and alive, counted in `HitCount`.
+* **Miss (key absent)** — key does not exist, counted in `MissCount`. This covers
+  cold starts, evicted keys and batch scans over keys that were never cached.
+* **Expired miss** — key exists but its TTL has elapsed, counted in
+  `ExpiredMissCount`.
+
+The derived ratios reconcile to one:
+
+* `HitRate = HitCount / LookupCount`
+* `MissRate = MissCount / LookupCount`
+* `ExpiredRate = ExpiredMissCount / LookupCount`
+* `LookupCount = HitCount + MissCount + ExpiredMissCount`
+
+Expired entries are deliberately kept out of `MissCount`: an expiration spike is
+a TTL policy signal, while `MissRate` reflects real capacity pressure (evictions,
+cold start). Capacity planning should therefore watch `MissRate` together with
+`EvacuateCount` instead of reacting to the aggregate hit rate alone.
+`ExpiredCount` still reports every observed expiration, including entries removed
+as expired during ring buffer evacuation.
+
 ## How it is done
 
 FreeCache avoids GC overhead by reducing the number of pointers.
