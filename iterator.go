@@ -62,11 +62,13 @@ func (it *Iterator) nextForSlot(seg *segment, slotId int) *Entry {
 		hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
 		if hdr.expireAt == 0 || hdr.expireAt > now {
 			entry := new(Entry)
-			entry.Key = make([]byte, hdr.keyLen)
+			keyLen := int(ptr.keyLength())
+			keyOffset := ptr.offset + ENTRY_HDR_SIZE + entryExtSizeForKeyLen(keyLen)
+			entry.Key = make([]byte, keyLen)
 			entry.Value = make([]byte, hdr.valLen)
 			entry.ExpireAt = hdr.expireAt
-			seg.rb.ReadAt(entry.Key, ptr.offset+ENTRY_HDR_SIZE)
-			seg.rb.ReadAt(entry.Value, ptr.offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+			seg.rb.ReadAt(entry.Key, keyOffset)
+			seg.rb.ReadAt(entry.Value, keyOffset+int64(keyLen))
 			return entry
 		}
 	}

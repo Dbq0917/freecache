@@ -53,7 +53,7 @@ func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
 }
 
 // Set sets a key, value and expiration for a cache entry and stores it in the cache.
-// If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
+// If the key is larger than MaxKeyLength or value is larger than 1/1024 of the cache size,
 // the entry will not be written to the cache. expireSeconds <= 0 means no expire,
 // but it can be evicted when cache is full.
 func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
@@ -161,7 +161,7 @@ func (cache *Cache) GetOrSet(key, value []byte, expireSeconds int) (retValue []b
 }
 
 // SetAndGet sets a key, value and expiration for a cache entry and stores it in the cache.
-// If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
+// If the key is larger than MaxKeyLength or value is larger than 1/1024 of the cache size,
 // the entry will not be written to the cache. expireSeconds <= 0 means no expire,
 // but it can be evicted when cache is full.  Returns existing value if record exists
 // with a bool value to indicate whether an existing record was found
@@ -181,7 +181,7 @@ func (cache *Cache) SetAndGet(key, value []byte, expireSeconds int) (retValue []
 
 // Update gets value for a key, passes it to updater function that decides if set should be called as well
 // This allows for an atomic Get plus Set call using the existing value to decide on whether to call Set.
-// If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
+// If the key is larger than MaxKeyLength or value is larger than 1/1024 of the cache size,
 // the entry will not be written to the cache. expireSeconds <= 0 means no expire,
 // but it can be evicted when cache is full. Returns bool value to indicate if existing record was found along with bool
 // value indicating the value was replaced and error if any
