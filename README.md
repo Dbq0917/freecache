@@ -70,6 +70,8 @@ The data set is sharded into 256 segments by the hash value of the key.
 Each segment has only two pointers, one is the ring buffer that stores keys and values, 
 the other one is the index slice which used to lookup for an entry.
 Each segment has its own lock, so it supports high concurrent access.
+The key-to-segment mapping stays stable, while segment ring buffers adapt to load:
+hot segments borrow capacity from cold segments and the total cache size stays fixed.
 
 ## TODO
 

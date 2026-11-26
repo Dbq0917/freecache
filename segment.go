@@ -51,6 +51,7 @@ type segment struct {
 	totalExpired  int64      // used for debug
 	overwrites    int64      // used for debug
 	touched       int64      // used for debug
+	accessCount   int64      // accesses used by the segment load balancer.
 	vacuumLen     int64      // up to vacuumLen, new data can be written without overwriting old data.
 	slotLens      [256]int32 // The actual length for every slot.
 	slotCap       int32      // max number of entry pointers a slot can hold.

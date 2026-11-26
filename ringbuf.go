@@ -28,7 +28,8 @@ func NewRingBuf(size int, begin int64) (rb RingBuf) {
 // Reset the ring buffer
 //
 // Parameters:
-//     begin: beginning offset of the data stream
+//
+//	begin: beginning offset of the data stream
 func (rb *RingBuf) Reset(begin int64) {
 	rb.begin = begin
 	rb.end = begin
@@ -220,22 +221,24 @@ func (rb *RingBuf) Resize(newSize int) {
 	if len(rb.data) == newSize {
 		return
 	}
+	if newSize <= 0 {
+		return
+	}
+	used := int(rb.end - rb.begin)
+	start := rb.begin
+	if used > newSize {
+		// Keep the newest bytes when shrinking; the logical stream offsets of
+		// those bytes are unchanged.
+		start = rb.end - int64(newSize)
+		used = newSize
+	}
 	newData := make([]byte, newSize)
-	var offset int
-	if rb.end-rb.begin == int64(len(rb.data)) {
-		offset = rb.index
-	}
-	if int(rb.end-rb.begin) > newSize {
-		discard := int(rb.end-rb.begin) - newSize
-		offset = (offset + discard) % len(rb.data)
-		rb.begin = rb.end - int64(newSize)
-	}
-	n := copy(newData, rb.data[offset:])
-	if n < newSize {
-		copy(newData[n:], rb.data[:offset])
+	if used > 0 {
+		rb.ReadAt(newData[:used], start)
 	}
 	rb.data = newData
-	rb.index = 0
+	rb.begin = start
+	rb.index = used % newSize
 }
 
 func (rb *RingBuf) Skip(length int64) {
