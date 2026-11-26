@@ -38,6 +38,7 @@ type entryHdr struct {
 // a segment contains 256 slots, a slot is an array of entry pointers ordered by hash16 value
 // the entry can be looked up by hash value of the key.
 type segment struct {
+	cache         *Cache
 	rb            RingBuf // ring buffer that stores data
 	segId         int
 	_             uint32
@@ -217,6 +218,11 @@ func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModi
 		seg.rb.ReadAt(oldHdrBuf[:], oldOff)
 		oldHdr := (*entryHdr)(unsafe.Pointer(&oldHdrBuf[0]))
 		oldEntryLen := ENTRY_HDR_SIZE + int64(oldHdr.keyLen) + int64(oldHdr.valCap)
+		if oldHdr.reserved == largeChunkMagic {
+			consecutiveEvacuate = 0
+			seg.vacuumLen += oldEntryLen
+			continue
+		}
 		if oldHdr.deleted {
 			consecutiveEvacuate = 0
 			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
@@ -252,18 +258,41 @@ func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModi
 }
 
 func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byte, expireAt uint32, err error) {
+	value, expireAt, err = seg.getTry(key, buf, hashVal, peek)
+	if err == errLargeLockBusy && seg.cache != nil {
+		return seg.cache.getLargeSlow(seg.segId, key, buf, hashVal, peek)
+	}
+	return value, expireAt, err
+}
+
+func (seg *segment) getTry(key, buf []byte, hashVal uint64, peek bool) (value []byte, expireAt uint32, err error) {
+	return seg.getInternal(key, buf, hashVal, peek, false)
+}
+
+func (seg *segment) getAllLocked(key, buf []byte, hashVal uint64, peek bool) (value []byte, expireAt uint32, err error) {
+	return seg.getInternal(key, buf, hashVal, peek, true)
+}
+
+func (seg *segment) getInternal(key, buf []byte, hashVal uint64, peek bool, allLocksHeld bool) (value []byte, expireAt uint32, err error) {
 	hdr, ptrOffset, err := seg.locate(key, hashVal, peek)
 	if err != nil {
 		return
 	}
 	expireAt = hdr.expireAt
-	if cap(buf) >= int(hdr.valLen) {
-		value = buf[:hdr.valLen]
+	if hdr.reserved == largeEntryMagic {
+		value, err = seg.readLargeValue(&hdr, ptrOffset, buf, allLocksHeld)
+		if err != nil {
+			return nil, hdr.expireAt, err
+		}
 	} else {
-		value = make([]byte, hdr.valLen)
-	}
+		if cap(buf) >= int(hdr.valLen) {
+			value = buf[:hdr.valLen]
+		} else {
+			value = make([]byte, hdr.valLen)
+		}
 
-	seg.rb.ReadAt(value, ptrOffset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+		seg.rb.ReadAt(value, ptrOffset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+	}
 	if !peek {
 		atomic.AddInt64(&seg.hitCount, 1)
 	}
@@ -277,10 +306,25 @@ func (seg *segment) view(key []byte, fn func([]byte) error, hashVal uint64, peek
 	if err != nil {
 		return
 	}
-	start := ptrOffset + ENTRY_HDR_SIZE + int64(hdr.keyLen)
-	val, err := seg.rb.Slice(start, int64(hdr.valLen))
-	if err != nil {
-		return err
+	var val []byte
+	if hdr.reserved == largeEntryMagic {
+		val, err = seg.readLargeValue(&hdr, ptrOffset, nil, false)
+		if err == errLargeLockBusy && seg.cache != nil {
+			val, _, err = seg.cache.getLargeSlow(seg.segId, key, nil, hashVal, peek)
+			if err != nil {
+				return err
+			}
+			return fn(val)
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		start := ptrOffset + ENTRY_HDR_SIZE + int64(hdr.keyLen)
+		val, err = seg.rb.Slice(start, int64(hdr.valLen))
+		if err != nil {
+			return err
+		}
 	}
 	err = fn(val)
 	if !peek {

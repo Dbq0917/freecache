@@ -752,11 +752,6 @@ func TestLargeEntry(t *testing.T) {
 	}
 	key = []byte("abcd")
 	maxValLen := cacheSize/1024 - ENTRY_HDR_SIZE - len(key)
-	val = make([]byte, maxValLen+1)
-	err = cache.Set(key, val, 0)
-	if err != ErrLargeEntry {
-		t.Error("err should be ErrLargeEntry", err)
-	}
 	val = make([]byte, maxValLen-2)
 	err = cache.Set(key, val, 0)
 	if err != nil {
@@ -777,8 +772,15 @@ func TestLargeEntry(t *testing.T) {
 	}
 	val = append(val, 0)
 	err = cache.Set(key, val, 0)
-	if err != ErrLargeEntry {
-		t.Error("err should be ErrLargeEntry", err)
+	if err != nil {
+		t.Fatal("oversized value should be chunked:", err)
+	}
+	got, err := cache.Get(key)
+	if err != nil {
+		t.Fatal("get chunked oversized value:", err)
+	}
+	if !bytes.Equal(got, val) {
+		t.Fatal("chunked oversized value mismatch")
 	}
 
 	cache.ResetStatistics()

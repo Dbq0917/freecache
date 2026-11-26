@@ -47,18 +47,29 @@ func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
 	}
 	cache = new(Cache)
 	for i := 0; i < segmentCount; i++ {
-		cache.segments[i] = newSegment(size/segmentCount, i, timer)
+		segment := newSegment(size/segmentCount, i, timer)
+		segment.cache = cache
+		cache.segments[i] = segment
 	}
 	return
 }
 
 // Set sets a key, value and expiration for a cache entry and stores it in the cache.
-// If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
-// the entry will not be written to the cache. expireSeconds <= 0 means no expire,
-// but it can be evicted when cache is full.
+// Keys larger than 65535 return ErrLargeKey. Values above the normal single-entry
+// limit are split into checksummed chunks and distributed across segment rings;
+// their index still has one hash lookup and one descriptor offset. ErrLargeEntry
+// is returned only when the chunks and descriptor cannot fit in cache capacity.
+// expireSeconds <= 0 means no expire, but entries can be evicted when full.
 func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
+	if len(key) > 65535 {
+		return ErrLargeKey
+	}
+	segment := &cache.segments[segID]
+	if len(key)+len(value) > segment.maxNormalEntryLen() {
+		return cache.setLargeEntry(int(segID), key, value, hashVal, expireSeconds)
+	}
 	cache.locks[segID].Lock()
 	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
 	cache.locks[segID].Unlock()
@@ -149,49 +160,103 @@ func (cache *Cache) GetFn(key []byte, fn func([]byte) error) (err error) {
 // it sets a new key, value and expiration for a cache entry and stores it in the cache, returns nil in that case
 func (cache *Cache) GetOrSet(key, value []byte, expireSeconds int) (retValue []byte, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
-	cache.locks[segID].Lock()
-	defer cache.locks[segID].Unlock()
+	segID := int(hashVal & segmentAndOpVal)
+	if len(key) <= 65535 && len(key)+len(value) > cache.segments[segID].maxNormalEntryLen() {
+		cache.lockAllSegments()
+		defer cache.unlockAllSegments()
+		retValue, _, err = cache.segments[segID].getAllLocked(key, nil, hashVal, false)
+		if err != nil {
+			err = cache.segments[segID].setLargeLocked(key, value, hashVal, expireSeconds)
+		}
+		return
+	}
 
-	retValue, _, err = cache.segments[segID].get(key, nil, hashVal, false)
-	if err != nil {
-		err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+	lockBusy := false
+	func() {
+		cache.locks[segID].Lock()
+		defer cache.locks[segID].Unlock()
+		retValue, _, err = cache.segments[segID].getTry(key, nil, hashVal, false)
+		if err == errLargeLockBusy {
+			lockBusy = true
+			return
+		}
+		if err != nil {
+			err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+		}
+	}()
+	if lockBusy {
+		cache.lockAllSegments()
+		defer cache.unlockAllSegments()
+		retValue, _, err = cache.segments[segID].getAllLocked(key, nil, hashVal, false)
+		if err != nil {
+			err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+		}
+		return
 	}
 	return
 }
 
 // SetAndGet sets a key, value and expiration for a cache entry and stores it in the cache.
-// If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
-// the entry will not be written to the cache. expireSeconds <= 0 means no expire,
+// Keys larger than 65535 return ErrLargeKey; oversized values are chunked.
+// ErrLargeEntry means the value and its descriptor exceed cache capacity.
+// expireSeconds <= 0 means no expire,
 // but it can be evicted when cache is full.  Returns existing value if record exists
 // with a bool value to indicate whether an existing record was found
 func (cache *Cache) SetAndGet(key, value []byte, expireSeconds int) (retValue []byte, found bool, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
-	cache.locks[segID].Lock()
-	defer cache.locks[segID].Unlock()
+	segID := int(hashVal & segmentAndOpVal)
+	if len(key) <= 65535 && len(key)+len(value) > cache.segments[segID].maxNormalEntryLen() {
+		cache.lockAllSegments()
+		defer cache.unlockAllSegments()
 
-	retValue, _, err = cache.segments[segID].get(key, nil, hashVal, false)
-	if err == nil {
-		found = true
+		retValue, _, err = cache.segments[segID].getAllLocked(key, nil, hashVal, false)
+		if err == nil {
+			found = true
+		}
+		err = cache.segments[segID].setLargeLocked(key, value, hashVal, expireSeconds)
+		return
 	}
-	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+
+	lockBusy := false
+	func() {
+		cache.locks[segID].Lock()
+		defer cache.locks[segID].Unlock()
+		retValue, _, err = cache.segments[segID].getTry(key, nil, hashVal, false)
+		if err == errLargeLockBusy {
+			lockBusy = true
+			return
+		}
+		if err == nil {
+			found = true
+		}
+		err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+	}()
+	if lockBusy {
+		cache.lockAllSegments()
+		defer cache.unlockAllSegments()
+		retValue, _, err = cache.segments[segID].getAllLocked(key, nil, hashVal, false)
+		if err == nil {
+			found = true
+		}
+		err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+		return
+	}
 	return
 }
 
 // Update gets value for a key, passes it to updater function that decides if set should be called as well
 // This allows for an atomic Get plus Set call using the existing value to decide on whether to call Set.
-// If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
-// the entry will not be written to the cache. expireSeconds <= 0 means no expire,
+// Keys larger than 65535 return ErrLargeKey; oversized replacement values are chunked.
+// expireSeconds <= 0 means no expire,
 // but it can be evicted when cache is full. Returns bool value to indicate if existing record was found along with bool
 // value indicating the value was replaced and error if any
 func (cache *Cache) Update(key []byte, updater Updater) (found bool, replaced bool, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
-	cache.locks[segID].Lock()
-	defer cache.locks[segID].Unlock()
+	segID := int(hashVal & segmentAndOpVal)
+	cache.lockAllSegments()
+	defer cache.unlockAllSegments()
 
-	retValue, _, err := cache.segments[segID].get(key, nil, hashVal, false)
+	retValue, _, err := cache.segments[segID].getAllLocked(key, nil, hashVal, false)
 	if err == nil {
 		found = true
 	} else {
@@ -201,7 +266,11 @@ func (cache *Cache) Update(key []byte, updater Updater) (found bool, replaced bo
 	if !replaced {
 		return
 	}
-	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+	if len(key) <= 65535 && len(key)+len(value) > cache.segments[segID].maxNormalEntryLen() {
+		err = cache.segments[segID].setLargeLocked(key, value, hashVal, expireSeconds)
+	} else {
+		err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+	}
 	return
 }
 

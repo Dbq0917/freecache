@@ -63,10 +63,18 @@ func (it *Iterator) nextForSlot(seg *segment, slotId int) *Entry {
 		if hdr.expireAt == 0 || hdr.expireAt > now {
 			entry := new(Entry)
 			entry.Key = make([]byte, hdr.keyLen)
-			entry.Value = make([]byte, hdr.valLen)
 			entry.ExpireAt = hdr.expireAt
 			seg.rb.ReadAt(entry.Key, ptr.offset+ENTRY_HDR_SIZE)
-			seg.rb.ReadAt(entry.Value, ptr.offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+			if hdr.reserved == largeEntryMagic {
+				value, _, err := seg.get(entry.Key, nil, hashFunc(entry.Key), true)
+				if err != nil {
+					continue
+				}
+				entry.Value = value
+			} else {
+				entry.Value = make([]byte, hdr.valLen)
+				seg.rb.ReadAt(entry.Value, ptr.offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+			}
 			return entry
 		}
 	}

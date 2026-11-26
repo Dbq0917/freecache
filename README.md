@@ -16,6 +16,7 @@ without increased latency and degraded throughput.
 * Expiration support
 * Nearly LRU algorithm
 * Strictly limited memory usage
+* Large values are split into checksummed chunks and striped across segment rings
 * Come with a toy server that supports a few basic Redis commands with pipeline
 * Iterator support
 
